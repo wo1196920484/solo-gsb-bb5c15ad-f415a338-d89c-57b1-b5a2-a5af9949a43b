@@ -9,7 +9,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from . import db, repo
+from . import consumers, db, repo
+from .consumers import ConsumerNotFoundError
 
 
 @asynccontextmanager
@@ -57,6 +58,52 @@ class EventAck(BaseModel):
     status: str
     replayed: bool
     stream: StreamStateOut
+
+
+class ClaimIn(BaseModel):
+    max_events: int = Field(
+        default=100, ge=1, le=10_000, description="Upper bound of events in one lease batch"
+    )
+
+    @field_validator("max_events", mode="before")
+    @classmethod
+    def _reject_bool(cls, value):
+        # In lax mode pydantic accepts bool as int; JSON booleans are not integers here.
+        if isinstance(value, bool):
+            raise ValueError("must be an integer, not a boolean")
+        return value
+
+    model_config = {"json_schema_extra": {"examples": [{"max_events": 100}]}}
+
+
+class ConsumerEventOut(BaseModel):
+    event_id: str
+    sequence: int
+    delta: int
+
+
+class ClaimOut(BaseModel):
+    lease_token: str | None = Field(
+        default=None, description="Null when no applied event is available yet"
+    )
+    expires_at: int | None = Field(
+        default=None, description="Unix epoch seconds when the lease expires"
+    )
+    start_sequence: int
+    event_count: int = 0
+    events: list[ConsumerEventOut] = []
+
+
+class AckIn(BaseModel):
+    lease_token: str = Field(..., min_length=1, description="Token returned by a prior claim")
+
+    model_config = {"json_schema_extra": {"examples": [{"lease_token": "<token-from-claim>"}]}}
+
+
+class ConsumerAckOut(BaseModel):
+    stream_id: str
+    consumer_id: str
+    cursor_sequence: int
 
 
 @app.get("/health", tags=["meta"])
@@ -110,3 +157,65 @@ def get_stream(stream_id: str) -> StreamStateOut:
             detail={"code": "stream_not_found", "message": f"unknown stream {stream_id!r}"},
         )
     return StreamStateOut(**state.as_dict())
+
+
+@app.post(
+    "/streams/{stream_id}/consumers/{consumer_id}/claim",
+    response_model=ClaimOut,
+    tags=["consumers"],
+    summary="Claim the next contiguous applied event batch (with a lease token)",
+)
+def claim_batch(
+    stream_id: str, consumer_id: str, payload: ClaimIn | None = None
+) -> ClaimOut:
+    body = payload if payload is not None else ClaimIn()
+    try:
+        claim = consumers.claim(stream_id, consumer_id, body.max_events)
+    except ConsumerNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": exc.code, "message": exc.message},
+        )
+    except sqlite3.IntegrityError as exc:
+        # Defence in depth: constraints (e.g. a concurrent lease insert) map to 409.
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "integrity_conflict", "message": str(exc)},
+        )
+
+    if claim is None:
+        # The claim transaction created the consumer row at its current cursor;
+        # re-read it so the empty response reports an accurate start_sequence.
+        with db.read_connection() as conn:
+            row = conn.execute(
+                "SELECT cursor_sequence FROM consumers "
+                "WHERE stream_id = ? AND consumer_id = ?",
+                (stream_id, consumer_id),
+            ).fetchone()
+        cursor = row["cursor_sequence"] if row is not None else 0
+        return ClaimOut(start_sequence=cursor)
+    return ClaimOut(**claim.as_dict())
+
+
+@app.post(
+    "/streams/{stream_id}/consumers/{consumer_id}/ack",
+    response_model=ConsumerAckOut,
+    tags=["consumers"],
+    summary="Acknowledge a leased batch and atomically advance the consumer cursor",
+)
+def acknowledge_batch(
+    stream_id: str, consumer_id: str, payload: AckIn
+) -> ConsumerAckOut:
+    try:
+        result = consumers.ack(stream_id, consumer_id, payload.lease_token)
+    except ConsumerNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": exc.code, "message": exc.message},
+        )
+    except repo.ConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        )
+    return ConsumerAckOut(**result.as_dict())

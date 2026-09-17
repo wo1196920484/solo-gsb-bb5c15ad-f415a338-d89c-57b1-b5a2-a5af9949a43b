@@ -16,3 +16,12 @@ def server_port() -> int:
         return int(os.environ.get("APP_PORT", "8000"))
     except ValueError:
         return 8000
+
+
+def lease_ttl_seconds() -> int:
+    """Lease lifetime in seconds (env var LEASE_TTL_SECONDS overrides default)."""
+    try:
+        ttl = int(os.environ.get("LEASE_TTL_SECONDS", "30"))
+    except ValueError:
+        return 30
+    return ttl if ttl >= 1 else 30

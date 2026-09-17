@@ -8,6 +8,7 @@ services:
     environment:
       APP_PORT: "8000"
       DATABASE_PATH: /data/events.db
+      LEASE_TTL_SECONDS: "30"
     volumes:
       - events-data:/data
     restart: unless-stopped

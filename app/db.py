@@ -65,6 +65,32 @@ def initialise() -> None:
             -- Fast lookup of the contiguous events that catch-up has to apply.
             CREATE INDEX IF NOT EXISTS idx_events_stream_applied_seq
                 ON events (stream_id, applied, sequence);
+
+            -- Per-consumer consumption cursor into the applied event prefix.
+            CREATE TABLE IF NOT EXISTS consumers (
+                stream_id       TEXT    NOT NULL,
+                consumer_id     TEXT    NOT NULL,
+                cursor_sequence INTEGER NOT NULL DEFAULT 0 CHECK (cursor_sequence >= 0),
+                PRIMARY KEY (stream_id, consumer_id),
+                FOREIGN KEY (stream_id) REFERENCES streams(stream_id)
+            );
+
+            -- At most one lease row per consumer: the PRIMARY KEY plus BEGIN
+            -- IMMEDIATE serialisation means concurrent instances can never hold
+            -- two valid leases for the same consumer at once.
+            CREATE TABLE IF NOT EXISTS consumer_leases (
+                stream_id      TEXT    NOT NULL,
+                consumer_id    TEXT    NOT NULL,
+                lease_token    TEXT    NOT NULL,
+                start_sequence INTEGER NOT NULL CHECK (start_sequence >= 0),
+                next_sequence  INTEGER NOT NULL CHECK (next_sequence >= 0),
+                event_count    INTEGER NOT NULL CHECK (event_count >= 0),
+                created_at     INTEGER NOT NULL,
+                expires_at     INTEGER NOT NULL,
+                PRIMARY KEY (stream_id, consumer_id),
+                FOREIGN KEY (stream_id, consumer_id)
+                    REFERENCES consumers(stream_id, consumer_id)
+            );
             """
         )
     finally:

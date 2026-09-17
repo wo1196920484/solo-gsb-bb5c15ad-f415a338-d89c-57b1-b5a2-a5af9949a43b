@@ -3,6 +3,7 @@
 import os
 import tempfile
 import threading
+import time
 import traceback
 
 tmp = tempfile.mkdtemp()
@@ -95,6 +96,71 @@ check("concurrent result", s.balance == 20 and s.next_sequence == 20 and s.pendi
 # 10. persistence: reopen connection and re-read
 s = repo.get_stream_state("s2")
 check("persisted read", s.balance == 250 and s.next_sequence == 2)
+
+# 11. consumer claim/ack cursor with leases
+from app import consumers  # noqa: E402
+
+os.environ["LEASE_TTL_SECONDS"] = "1"
+for seq in range(6):
+    repo.submit_event("s6", f"e{seq}", seq, 1)
+
+c = consumers.claim("s6", "w1", 3)
+check("claim first 3", c is not None and c.start_sequence == 0 and
+      [e.sequence for e in c.events] == [0, 1, 2] and c.event_count == 3, str(c))
+c_same = consumers.claim("s6", "w1", 100)
+check("repeat claim identical lease", c_same.lease_token == c.lease_token and
+      [e.sequence for e in c_same.events] == [0, 1, 2])
+
+# other consumer is independent, wrong token rejected
+other = consumers.claim("s6", "w2", 2)
+try:
+    consumers.ack("s6", "w1", other.lease_token)
+    check("ack wrong token -> 409", False)
+except repo.ConflictError as e:
+    check("ack wrong token -> 409", e.code == "stale_lease_token")
+
+a = consumers.ack("s6", "w1", c.lease_token)
+check("ack advances cursor", a.cursor_sequence == 3, str(a))
+try:
+    consumers.ack("s6", "w1", c.lease_token)
+    check("double ack -> 409", False)
+except repo.ConflictError as e:
+    check("double ack -> 409", e.code == "lease_not_found")
+
+nxt = consumers.claim("s6", "w1", 10)
+check("next claim continues at cursor", [e.sequence for e in nxt.events] == [3, 4, 5])
+consumers.ack("s6", "w1", nxt.lease_token)
+check("claim at tip is empty", consumers.claim("s6", "w1", 10) is None)
+
+# expiry: same batch redelivered, old token rejected
+time.sleep(1.1)
+redelivered = consumers.claim("s6", "w2", 10)
+check("expired lease redelivers from cursor",
+      redelivered.lease_token != other.lease_token and
+      [e.sequence for e in redelivered.events] == [0, 1, 2, 3, 4, 5])
+try:
+    consumers.ack("s6", "w2", other.lease_token)
+    check("expired token ack -> 409", False)
+except repo.ConflictError as e:
+    check("expired token ack -> 409", e.code in ("lease_expired", "stale_lease_token"))
+
+# 12. concurrent claims never produce parallel valid leases
+for seq in range(20):
+    repo.submit_event("s7", f"e{seq}", seq, 1)
+lease_tokens = []
+def claim():
+    try:
+        lease_tokens.append(consumers.claim("s7", "wg", 5).lease_token)
+    except Exception:
+        errors.append(traceback.format_exc())
+
+threads = [threading.Thread(target=claim) for _ in range(20)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+check("concurrent claims one lease", len(set(lease_tokens)) == 1 and len(lease_tokens) == 20,
+      str(set(lease_tokens)))
 
 print()
 if failures:
