@@ -16,3 +16,12 @@ def server_port() -> int:
         return int(os.environ.get("APP_PORT", "8000"))
     except ValueError:
         return 8000
+
+
+def lease_duration_seconds() -> int:
+    """Lifetime of a claim lease (env var LEASE_DURATION_SECONDS overrides default)."""
+    try:
+        value = int(os.environ.get("LEASE_DURATION_SECONDS", "30"))
+    except ValueError:
+        return 30
+    return value if value > 0 else 30

@@ -65,6 +65,25 @@ def initialise() -> None:
             -- Fast lookup of the contiguous events that catch-up has to apply.
             CREATE INDEX IF NOT EXISTS idx_events_stream_applied_seq
                 ON events (stream_id, applied, sequence);
+
+            -- One row per (stream, consumer): the consumption cursor plus the
+            -- at-most-one outstanding claim lease. Lease columns are either all
+            -- NULL (no lease) or all set together.
+            CREATE TABLE IF NOT EXISTS consumers (
+                stream_id        TEXT    NOT NULL,
+                consumer_id      TEXT    NOT NULL,
+                cursor_seq       INTEGER NOT NULL DEFAULT 0 CHECK (cursor_seq >= 0),
+                lease_token      TEXT,
+                lease_expires_at INTEGER CHECK (lease_expires_at IS NULL OR lease_expires_at >= 0),
+                lease_from_seq   INTEGER,
+                lease_to_seq     INTEGER CHECK (lease_to_seq IS NULL OR lease_to_seq >= 0),
+                PRIMARY KEY (stream_id, consumer_id),
+                FOREIGN KEY (stream_id) REFERENCES streams(stream_id),
+                CHECK ((lease_token IS NULL) = (lease_expires_at IS NULL)),
+                CHECK ((lease_token IS NULL) = (lease_from_seq IS NULL)),
+                CHECK ((lease_token IS NULL) = (lease_to_seq IS NULL)),
+                CHECK (lease_to_seq IS NULL OR lease_to_seq >= lease_from_seq)
+            );
             """
         )
     finally:

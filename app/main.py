@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from . import db, repo
+from . import consumers, db, repo
 
 
 @asynccontextmanager
@@ -57,6 +57,51 @@ class EventAck(BaseModel):
     status: str
     replayed: bool
     stream: StreamStateOut
+
+
+class ClaimIn(BaseModel):
+    max_events: int = Field(
+        ..., ge=1, le=10_000, description="Maximum number of events in this batch"
+    )
+
+    @field_validator("max_events", mode="before")
+    @classmethod
+    def _reject_bool(cls, value):
+        # In lax mode pydantic accepts bool as int; JSON booleans are not integers here.
+        if isinstance(value, bool):
+            raise ValueError("must be an integer, not a boolean")
+        return value
+
+    model_config = {"json_schema_extra": {"examples": [{"max_events": 100}]}}
+
+
+class ClaimedEventOut(BaseModel):
+    event_id: str
+    sequence: int
+    delta: int
+
+
+class ClaimOut(BaseModel):
+    stream_id: str
+    consumer_id: str
+    lease_token: str
+    expires_at: int = Field(..., description="POSIX milliseconds; the lease is valid until then")
+    from_sequence: int
+    to_sequence: int = Field(..., description="Exclusive upper bound of the claimed batch")
+    events: list[ClaimedEventOut]
+
+
+class AckIn(BaseModel):
+    lease_token: str = Field(..., min_length=1)
+
+    model_config = {"json_schema_extra": {"examples": [{"lease_token": "<token from claim>"}]}}
+
+
+class AckOut(BaseModel):
+    status: str
+    stream_id: str
+    consumer_id: str
+    cursor: int = Field(..., description="New cursor sequence (next event this consumer will receive)")
 
 
 @app.get("/health", tags=["meta"])
@@ -110,3 +155,48 @@ def get_stream(stream_id: str) -> StreamStateOut:
             detail={"code": "stream_not_found", "message": f"unknown stream {stream_id!r}"},
         )
     return StreamStateOut(**state.as_dict())
+
+
+@app.post(
+    "/streams/{stream_id}/consumers/{consumer_id}/claim",
+    response_model=ClaimOut,
+    status_code=200,
+    tags=["consumers"],
+    summary="Claim the next contiguous applied event batch (with a lease token)",
+)
+def claim_batch(stream_id: str, consumer_id: str, body: ClaimIn) -> ClaimOut:
+    claim = consumers.claim(stream_id, consumer_id, body.max_events)
+    if claim is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "stream_not_found", "message": f"unknown stream {stream_id!r}"},
+        )
+    return ClaimOut(**claim.as_dict())
+
+
+@app.post(
+    "/streams/{stream_id}/consumers/{consumer_id}/ack",
+    response_model=AckOut,
+    status_code=200,
+    tags=["consumers"],
+    summary="Acknowledge a claimed batch and atomically advance the cursor",
+)
+def ack_batch(stream_id: str, consumer_id: str, body: AckIn) -> AckOut:
+    try:
+        cursor = consumers.ack(stream_id, consumer_id, body.lease_token)
+    except consumers.LeaseError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        )
+    if cursor is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "stream_not_found", "message": f"unknown stream {stream_id!r}"},
+        )
+    return AckOut(
+        status="ok",
+        stream_id=stream_id,
+        consumer_id=consumer_id,
+        cursor=cursor,
+    )

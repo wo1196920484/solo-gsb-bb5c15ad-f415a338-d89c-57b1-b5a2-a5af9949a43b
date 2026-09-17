@@ -16,6 +16,11 @@
   事件不受影响。
 - **并发安全**：SQLite WAL 模式 + `BEGIN IMMEDIATE`，并发提交串行化，每个序号
   恰好应用一次。
+- **消费游标与租约**：消费者可领取（claim）从自身游标开始、已应用且连续的事件批，
+  服务端发放带 `expires_at` 的 `lease_token`；租约未到期重复领取返回**同一批次、
+  同一 token**，持 token 确认（ack）后游标原子推进；过期/旧 token 返回 `409`，
+  租约到期后同批事件可被再次领取（at-least-once）。多个实例并发领取也只会存在
+  一个有效租约。
 - 无外部账号、无外部依赖，`docker compose up --build` 一条命令启动。
 
 ## 一键启动
@@ -85,6 +90,70 @@ GET /streams/{stream_id}
 
 流不存在时返回 `404`。
 
+### 3. 消费者领取事件（claim）
+
+```
+POST /streams/{stream_id}/consumers/{consumer_id}/claim
+Content-Type: application/json
+```
+
+请求体：
+
+| 字段        | 类型 | 约束              | 说明                                   |
+| ----------- | ---- | ----------------- | -------------------------------------- |
+| `max_events` | int  | `1 <= max_events <= 10000` | 本批最多返回多少事件                   |
+
+从该消费者**游标**开始，返回已应用（applied）且连续的事件，最多 `max_events`
+条；同时生成一个带 `expires_at`（POSIX 毫秒）的租约 `lease_token`。
+
+- 租约**未到期**时重复领取（`consumer_id` 相同）始终返回同一批次、同一 token、
+  同一 `expires_at`，忽略新的 `max_events`；
+- 没有可消费事件时返回空批次（`events: []`，`from_sequence == to_sequence`），
+  但同样发放租约；
+- 游标之后若有事件尚未应用（缺号），本批只包含连续已应用部分；
+- 流不存在返回 `404`，参数非法返回 `422`。
+
+```json
+{
+  "stream_id": "acct-1",
+  "consumer_id": "worker-a",
+  "lease_token": "dJQ8DuW6F_uuBYrN1OeG2TtsVCuLivSi",
+  "expires_at": 1789676192280,
+  "from_sequence": 0,
+  "to_sequence": 2,
+  "events": [
+    {"event_id": "e0", "sequence": 0, "delta": 100},
+    {"event_id": "e1", "sequence": 1, "delta": 200}
+  ]
+}
+```
+
+### 4. 消费者确认批次（ack）
+
+```
+POST /streams/{stream_id}/consumers/{consumer_id}/ack
+Content-Type: application/json
+```
+
+请求体：`{"lease_token": "<claim 返回的 token>"}`。
+
+只有 token **匹配当前未过期租约**时，才在同一个事务内把游标原子推进到
+`to_sequence` 并清除租约：
+
+```json
+{"status": "ok", "stream_id": "acct-1", "consumer_id": "worker-a", "cursor": 2}
+```
+
+- `409 Conflict` 的情形：
+  - `lease_not_active`：该消费者当前没有有效租约（尚未 claim，或已 ack）；
+  - `lease_token_mismatch`：token 与当前租约不符（旧租约的 token、伪造 token）；
+  - `lease_expired`：token 匹配的租约已过期。
+- 租约到期后 token 失效（ack 返回 `409`），同批事件可被再次领取，新领取会得到
+  新 token；
+- 流不存在返回 `404`，请求体缺少 `lease_token` 返回 `422`。
+
+不同 `consumer_id` 的游标与租约彼此独立；游标和租约都持久化在 SQLite 中。
+
 ## 工作机制示例
 
 ```bash
@@ -129,17 +198,79 @@ curl -i -X POST localhost:8000/streams/acct-1/events \
 curl -s localhost:8000/streams/acct-1
 ```
 
+## 消费游标示例（claim / ack）
+
+```bash
+# 先准备三个已应用事件（接上文，acct-1 的 next_sequence=3）
+# 消费者 worker-a 领取最多 2 个事件
+curl -s -X POST localhost:8000/streams/acct-1/consumers/worker-a/claim \
+  -H 'Content-Type: application/json' \
+  -d '{"max_events":2}'
+# {
+#   "stream_id":"acct-1","consumer_id":"worker-a",
+#   "lease_token":"dJQ8DuW6F_uuBYrN1OeG2TtsVCuLivSi",
+#   "expires_at":1789676192280,"from_sequence":0,"to_sequence":2,
+#   "events":[{"event_id":"e0","sequence":0,"delta":100},
+#             {"event_id":"e1","sequence":1,"delta":200}]
+# }
+
+# 租约未到期重复领取：同一批次、同一 token、同一 expires_at
+curl -s -X POST localhost:8000/streams/acct-1/consumers/worker-a/claim \
+  -H 'Content-Type: application/json' -d '{"max_events":99}'
+# -> lease_token 不变，events 仍是 [e0, e1]
+
+# 用错误/旧 token 确认：409
+curl -i -X POST localhost:8000/streams/acct-1/consumers/worker-a/ack \
+  -H 'Content-Type: application/json' -d '{"lease_token":"bogus"}'
+# HTTP/1.1 409 -> {"detail":{"code":"lease_token_mismatch", ...}}
+
+# 用有效 token 确认：游标原子推进到 2
+curl -s -X POST localhost:8000/streams/acct-1/consumers/worker-a/ack \
+  -H 'Content-Type: application/json' \
+  -d '{"lease_token":"dJQ8DuW6F_uuBYrN1OeG2TtsVCuLivSi"}'
+# {"status":"ok","stream_id":"acct-1","consumer_id":"worker-a","cursor":2}
+
+# 再次领取：从游标 2 继续
+curl -s -X POST localhost:8000/streams/acct-1/consumers/worker-a/claim \
+  -H 'Content-Type: application/json' -d '{"max_events":10}'
+# -> events=[e2]，from_sequence=2, to_sequence=3
+
+# 租约到期后再用旧 token 确认：409 lease_expired；
+# 重新 claim 可再次拿到同批事件（新 token）。
+```
+
 ## 数据模型
 
 ```text
 streams(stream_id PK, balance, next_sequence)
 events(stream_id, event_id, sequence, delta, applied,
        PK(stream_id, event_id), UNIQUE(stream_id, sequence))
+consumers(stream_id, consumer_id, cursor_seq,
+          lease_token, lease_expires_at, lease_from_seq, lease_to_seq,
+          PK(stream_id, consumer_id))
 ```
 
 - `UNIQUE(stream_id, event_id)` 保证重放幂等；
 - `UNIQUE(stream_id, sequence)` 保证序号唯一；
-- `applied=0` 表示暂存，`applied=1` 表示已计入余额。
+- `applied=0` 表示暂存，`applied=1` 表示已计入余额；
+- 每个 `(stream_id, consumer_id)` 一行：`cursor_seq` 为消费游标（下一个待领取
+  的序号），租约四列要么整体为 NULL（无有效租约），要么整体非空。一行只持有一个
+  租约，因此领取与确认都在 `BEGIN IMMEDIATE` 事务内串行执行——即使多个应用实例
+  同时领取，数据库中也只会存在一个有效租约。
+
+租约生命周期：
+
+1. claim 时若存在未到期租约（`lease_expires_at > now`），直接返回该租约覆盖的
+   原有批次（`lease_from_seq..lease_to_seq`）、原 token、原到期时间；
+2. 否则从 `cursor_seq` 起取连续已应用事件（序号上界为流的 `next_sequence`），
+   至多 `max_events` 条，生成新 token（`secrets.token_urlsafe`）和
+   `expires_at = now + LEASE_DURATION_SECONDS`，写入租约四列并提交；
+3. ack 在单个 `BEGIN IMMEDIATE` 事务内校验：存在流（否则 `404`）→ 存在租约
+   （否则 `lease_not_active`）→ token 一致（否则 `lease_token_mismatch`）→
+   未过期（否则 `lease_expired`）；全部通过后把游标推进到 `lease_to_seq` 并清空
+   租约列，原子提交；
+4. 租约到期不会自动删除：旧 token 无法 ack（`409`），下一次 claim 会发放新
+   token，同一批事件可被重新消费。
 
 提交事件的处理在单个 `BEGIN IMMEDIATE` 事务内完成：
 
@@ -154,10 +285,11 @@ events(stream_id, event_id, sequence, delta, applied,
 
 ## 配置
 
-| 环境变量        | 默认值                | 说明            |
-| --------------- | --------------------- | --------------- |
-| `APP_PORT`      | `8000`                | 服务监听端口    |
-| `DATABASE_PATH` | `/data/events.db`     | SQLite 文件路径 |
+| 环境变量                | 默认值                | 说明                          |
+| ----------------------- | --------------------- | ----------------------------- |
+| `APP_PORT`              | `8000`                | 服务监听端口                  |
+| `DATABASE_PATH`         | `/data/events.db`     | SQLite 文件路径               |
+| `LEASE_DURATION_SECONDS` | `30`                 | claim 租约有效时长（秒，> 0） |
 
 ## 运行测试
 
@@ -167,7 +299,10 @@ pytest -q
 ```
 
 `tests/test_api.py` 覆盖：顺序累加、缺号暂存与自动追赶、幂等重放、两种 409、
-404、422 参数校验、大批量追赶以及 20 线程并发。
+404、422 参数校验、大批量追赶以及 20 线程并发；消费者游标部分覆盖：领取连续批次、
+缺号时只返回已应用事件、租约内重复领取同批同 token、ack 推进游标、错误/旧/过期
+token 的三种 409、租约到期后同批重新领取、多消费者独立游标、空批次以及 20 线程
+并发只产生一个有效租约。
 
 仅用 Python 标准库验证核心归并算法（无需安装 FastAPI）：
 
@@ -183,6 +318,7 @@ python3 verify_core.py
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由与请求/响应模型
 │   ├── repo.py        # 归并/追赶算法（纯 sqlite3，事务边界清晰）
+│   ├── consumers.py   # 消费游标与 claim/ack 租约
 │   ├── db.py          # 连接管理、WAL、schema 初始化
 │   └── config.py      # 环境变量配置
 ├── tests/test_api.py
